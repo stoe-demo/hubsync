@@ -1,15 +1,17 @@
 #!/usr/bin/env ruby
 #
-# Syncs all repositories of a user/organization on github.com to a user/organization of a GitHub Enterprise instance.
+# Syncs all repositories of a user/organization on a GitHub Enterprise instance to a user/organization of another GitHub Enterprise instance.
 #
 # Usage:
-# ./hubsync.rb <github.com organization>        \
-#              <github.com access-token>        \
-#              <github enterprise url>          \
-#              <github enterprise organization> \
-#              <github enterprise token>        \
-#              <repository-cache-path>          \
-#              [<repository-to-sync>]
+# ./hubsync.rb --ghes-source-url=<source github enterprise url>     \
+#              --ghes-source-token=<source github enterprise token> \
+#              --source-org=<source github enterprise organization> \
+#              --ghes-target-url=<target github enterprise url>     \
+#              --ghes-target-token=<target github enterprise token> \
+#              --target-org=<target github enterprise organization>  \
+#              --cache-path=<repository-cache-path>                 \
+#              [--repo-name=<repository-to-sync>]
+
 #
 # Note:
 # <repository-to-sync> can be the name of one repository or a collection of repositories separated by ","
@@ -21,6 +23,7 @@ require 'octokit'
 require 'git'
 require 'fileutils'
 require 'timeout'
+require 'optparse'
 
 
 module Git
@@ -86,61 +89,66 @@ module Git
 end
 
 
-def init_github_clients(dotcom_token, enterprise_token, enterprise_url)
+def init_github_clients(ghes_source_token, ghes_source_url, ghes_target_token, ghes_target_url)
     clients = {}
-    clients[:githubcom] = Octokit::Client.new(:access_token => dotcom_token, :auto_paginate => true)
 
     Octokit.configure do |c|
-      c.api_endpoint = "#{enterprise_url}/api/v3"
-      c.web_endpoint = "#{enterprise_url}"
+      c.api_endpoint = "#{ghes_source_url}/api/v3"
+      c.web_endpoint = "#{ghes_source_url}"
+    end
+    clients[:source] = Octokit::Client.new(:access_token => ghes_source_token, :auto_paginate => true)
+
+    Octokit.configure do |c|
+      c.api_endpoint = "#{ghes_target_url}/api/v3"
+      c.web_endpoint = "#{ghes_target_url}"
     end
 
-    clients[:enterprise] = Octokit::Client.new(:access_token => enterprise_token, :auto_paginate => true)
+    clients[:target] = Octokit::Client.new(:access_token => ghes_target_token, :auto_paginate => true)
     return clients
 end
 
 
-def create_internal_repository(repo_dotcom, github, organization)
-    puts "Repository `#{repo_dotcom.name}` not found on internal Github. Creating repository..."
+def create_internal_repository(repo_source, github, organization)
+    puts "Repository `#{repo_source.name}` not found on internal Github. Creating repository..."
     return github.create_repository(
-        repo_dotcom.name,
+        repo_source.name,
         :organization => organization,
-        :description => "This repository is automatically synced. Please push changes to #{repo_dotcom.clone_url}",
+        :description => "This repository is automatically synced. Please push changes to #{repo_source.clone_url}",
         :homepage => 'https://larsxschneider.github.io/2014/08/04/hubsync/',
         :has_issues => false,
         :has_wiki => false,
         :has_downloads => false,
-        :default_branch => repo_dotcom.default_branch
+        :default_branch => repo_source.default_branch
     )
 end
 
 
-def init_enterprise_repository(repo_dotcom, github, organization)
-    repo_int_url = "#{organization}/#{repo_dotcom.name}"
+def init_enterprise_repository(repo_source, github, organization)
+    repo_int_url = "#{organization}/#{repo_source.name}"
     if github.repository? repo_int_url
         return github.repository(repo_int_url)
     else
-        return create_internal_repository(repo_dotcom, github, organization)
+        return create_internal_repository(repo_source, github, organization)
     end
 end
 
 
-def init_local_repository(cache_path, repo_dotcom, repo_enterprise)
+def init_local_repository(cache_path, repo_source, repo_target)
     FileUtils::mkdir_p cache_path
-    repo_local_dir = "#{cache_path}/#{repo_enterprise.name}"
+    repo_local_dir = "#{cache_path}/#{repo_target.name}"
 
     if File.directory? repo_local_dir
         repo_local = Git.bare(repo_local_dir)
     else
-        puts "Cloning `#{repo_dotcom.name}`..."
+        puts "Cloning `#{repo_source.name}`..."
 
         repo_local = Git.clone(
-            repo_dotcom.clone_url,
-            repo_dotcom.name,
+            repo_source.clone_url,
+            repo_source.name,
             :path => cache_path,
             :mirror => true
         )
-        repo_local.remote_set_url('origin', repo_enterprise.clone_url, :push => true)
+        repo_local.remote_set_url('origin', repo_target.clone_url, :push => true)
     end
     return repo_local
 end
@@ -163,53 +171,129 @@ def remove_github_readonly_refs(repo_local)
 end
 
 
-def sync(clients, dotcom_organization, enterprise_organization, repo_name, cache_path)
-    clients[:githubcom].organization_repositories(dotcom_organization).each do |repo_dotcom|
+def sync(clients, source_organization, target_organization, repo_name, cache_path)
+    clients[:source].organization_repositories(source_organization).each do |repo_source|
         begin
-            if (repo_name.nil? || (repo_name.split(",").include? repo_dotcom.name))
+            if (repo_name.nil? || (repo_name.split(",").include? repo_source.name))
                 # The sync of each repository must not take longer than 15 min
                 Timeout.timeout(60*15) do
-                    repo_enterprise = init_enterprise_repository(repo_dotcom, clients[:enterprise], enterprise_organization)
+                    repo_target = init_enterprise_repository(repo_source, clients[:target], target_organization)
 
-                    puts "Syncing #{repo_dotcom.name}..."
-                    puts "    Source: #{repo_dotcom.clone_url}"
-                    puts "    Target: #{repo_enterprise.clone_url}"
+                    puts "Syncing #{repo_source.name}..."
+                    puts "    Source: #{repo_source.clone_url}"
+                    puts "    Target: #{repo_target.clone_url}"
                     puts
 
-                    repo_enterprise.clone_url = repo_enterprise.clone_url.sub(
+                    repo_target.clone_url = repo_target.clone_url.sub(
                         'https://',
-                        "https://#{clients[:enterprise].access_token}:x-oauth-basic@"
+                        "https://#{clients[:target].access_token}:x-oauth-basic@"
                     )
-                    repo_local = init_local_repository(cache_path, repo_dotcom, repo_enterprise)
+                    repo_local = init_local_repository(cache_path, repo_source, repo_target)
 
                     repo_local.remote('origin').fetch(:tags => true, :prune => true)
                     remove_github_readonly_refs(repo_local)
-                    repo_local.push('origin', repo_dotcom.default_branch, :force => true, :mirror => true)
+                    repo_local.push('origin', repo_source.default_branch, :force => true, :mirror => true)
                 end
             end
         rescue StandardError => e
-            puts "Syncing #{repo_dotcom.name} FAILED!"
+            puts "Syncing #{repo_source.name} FAILED!"
             puts e.message
             puts e.backtrace.inspect
         end
     end
 end
 
+Options = Struct.new(
+    :ghes_source_url,
+    :ghes_source_token,
+    :source_organization,
+    :ghes_target_url,
+    :ghes_target_token,
+    :target_organization,
+    :cache_path,
+    :repo_name
+    )
+
+def parseCommandLine(options)
+    args = Options.new
+
+    opt_parser = OptionParser.new do |opts|
+        opts.banner = "Usage: hubsync.rb [options]"
+
+        opts.on("--ghes-source-url=URL") do |v|
+            args.ghes_source_url = v
+        end
+
+        opts.on("--ghes-source-token=TOKEN") do |v|
+            args.ghes_source_token = v
+        end
+
+        opts.on("--source-org=ORG_NAME") do |v|
+            args.source_organization = v
+        end
+
+        opts.on("--ghes-target-url=URL") do |v|
+            args.ghes_target_url = v
+        end
+
+        opts.on("--ghes-target-token=TOKEN") do |v|
+            args.ghes_target_token = v
+        end
+
+        opts.on("--target-org=ORG_NAME") do |v|
+            args.target_organization = v
+        end
+
+        opts.on("--cache-path=PATH") do |v|
+            args.cache_path = v
+        end
+
+        opts.on("--repo-name=NAME") do |v|
+            args.repo_name = v
+        end
+    end
+
+    opt_parser.parse!()
+
+    missing = false
+    args.each_pair do |name, value|
+        if name.to_s != "repo_name"
+            if value.nil?
+                puts("Missing value for parameter; " + name.to_s)
+                missing = true
+            end
+        end
+    end
+
+    if missing
+        puts(opt_parser)
+        exit 1
+    end
+
+    return args
+end
+
 
 if $0 == __FILE__
-    dotcom_organization = ARGV[0]
-    dotcom_token = ARGV[1]
-    enterprise_url = ARGV[2]
-    enterprise_organization = ARGV[3]
-    enterprise_token = ARGV[4]
-    cache_path = ARGV[5]
-    repo_name = ARGV[6]
+    args = parseCommandLine(ARGV)
 
-    clients = init_github_clients(dotcom_token, enterprise_token, enterprise_url)
+    clients = init_github_clients(
+        args.ghes_source_token,
+        args.ghes_source_url,
+        args.ghes_target_token,
+        args.ghes_target_url
+    )
+
     while true do
         sleep(1)
         begin
-            sync(clients, dotcom_organization, enterprise_organization, repo_name, cache_path)
+            sync(
+                clients,
+                args.source_organization,
+                args.target_organization,
+                args.repo_name,
+                args.cache_path
+            )
         rescue SystemExit, Interrupt
             raise
         rescue Exception => e
